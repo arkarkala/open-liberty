@@ -58,6 +58,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.logging.Level;
 import java.util.logging.Logger;
+import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 import javax.json.Json;
@@ -251,6 +252,8 @@ public class LibertyServer implements LogMonitorClient {
     protected String messageAbsPath = null;
     protected String consoleAbsPath = null;
     protected String traceAbsPath = null;
+
+    protected final List<String> extraArgs = new ArrayList<String>();
 
     protected String machineJava; // Path to Java 6 JDK on the Machine
 
@@ -712,7 +715,7 @@ public class LibertyServer implements LogMonitorClient {
      */
     public void reconfigureServerUsingExpandedConfiguration(String testName, String newConfig, String... waitForMessages) throws Exception {
 
-        reconfigureServerUsingExpandedConfiguration(testName, "configs", newConfig, waitForMessages);
+        reconfigureServerUsingExpandedConfiguration(testName, "configs", newConfig, true, waitForMessages);
     }
 
     /**
@@ -726,12 +729,14 @@ public class LibertyServer implements LogMonitorClient {
      * @param waitForMessages - Any messages to wait (used to determine if the update is complete)
      * @throws Exception
      */
-    public void reconfigureServerUsingExpandedConfiguration(String testName, String configDir, String newConfig, String... waitForMessages) throws Exception {
+    public void reconfigureServerUsingExpandedConfiguration(String testName, String configDir, String newConfig, boolean resetMark, String... waitForMessages) throws Exception {
 
         ServerFileUtils serverFileUtils = new ServerFileUtils();
         String newServerCfg = serverFileUtils.expandAndBackupCfgFile(this, configDir + "/" + newConfig, testName);
         Log.info(c, "reconfigureServerUsingExpandedConfiguration", "Reconfiguring server to use new config: " + newConfig);
-        setMarkToEndOfLog();
+        if (resetMark) {
+            setMarkToEndOfLog();
+        }
         replaceServerConfiguration(newServerCfg);
 
         Thread.sleep(200); // Sleep for 200ms to ensure we do not process the file "too quickly" by a subsequent call
@@ -976,11 +981,11 @@ public class LibertyServer implements LogMonitorClient {
         return args;
     }
 
-    protected ProgramOutput startServerWithArgs(boolean preClean, boolean cleanStart,
-                                                boolean validateApps, boolean expectStartFailure,
-                                                String serverCmd, List<String> args,
-                                                boolean validateTimedExit) throws Exception {
-        final String method = "startServerAndValidate";
+    public ProgramOutput startServerWithArgs(boolean preClean, boolean cleanStart,
+                                             boolean validateApps, boolean expectStartFailure,
+                                             String serverCmd, List<String> args,
+                                             boolean validateTimedExit) throws Exception {
+        final String method = "startServerWithArgs";
         Log.info(c, method, ">>> STARTING SERVER: " + this.getServerName());
         Log.info(c, method, "Starting " + this.getServerName() + "; clean=" + cleanStart + ", validateApps=" + validateApps + ", expectStartFailure=" + expectStartFailure
                             + ", cmd=" + serverCmd + ", args=" + args);
@@ -1040,6 +1045,8 @@ public class LibertyServer implements LogMonitorClient {
         if (args != null) {
             parametersList.addAll(args);
         }
+
+        parametersList.addAll(extraArgs);
 
         //Setup the server logs assuming the default setting.
         messageAbsPath = logsRoot + messageFileName;
@@ -2071,6 +2078,55 @@ public class LibertyServer implements LogMonitorClient {
 
     public ProgramOutput stopServer(boolean postStopServerArchive, String... expectedFailuresRegExps) throws Exception {
         return this.stopServer(postStopServerArchive, false, expectedFailuresRegExps);
+    }
+
+    public LocalFile dumpServer(final String destination) throws Exception {
+        LocalFile lf = null;
+        final String method = "dumpServer";
+        try {
+            Log.info(c, method, "<<< DUMPING SERVER: " + this.getServerName());
+
+            if (!isStarted) {
+                Log.info(c, method, "Server " + serverToUse + " is not running (stop called previously).");
+                return null;
+            }
+
+            String cmd = installRoot + "/bin/server";
+            String[] parameters = new String[] { "dump", serverToUse };
+
+            //Need to ensure JAVA_HOME is set correctly - can't rely on user's environment to be set to the same Java as the build/runtime environment
+            Properties envVars = new Properties();
+            envVars.setProperty("JAVA_HOME", machineJava);
+            if (customUserDir)
+                envVars.setProperty("WLP_USER_DIR", userDir);
+            Log.finer(c, method, "Using additional env props: " + envVars.toString());
+
+            final ProgramOutput output = machine.execute(cmd, parameters, envVars);
+
+            String stdout = output.getStdout();
+            Log.info(c, method, "Dump Server Response: " + stdout);
+            if (output.getReturnCode() != 0)
+                Log.info(c, method, "Return code from script is: " + output.getReturnCode());
+
+            final String regex = "Server .+ dump complete in (.+)\\.";
+            final Matcher m = Pattern.compile(regex).matcher(stdout);
+            if (m.find()) {
+                final String dumpPath = m.group(1);
+                Log.info(c, method, "Dump file on server: " + dumpPath);
+                if (dumpPath != null) {
+                    final RemoteFile dumpFile = new RemoteFile(machine, dumpPath);
+                    Log.info(c, method, "Copying RemoteFile " + dumpFile + " to " + pathToAutoFVTTestFiles + "/tmp/" + destination);
+                    lf = copyFileToTempDir(dumpFile, destination);
+                }
+            } else {
+                Log.info(c, method, "Matcher failed.");
+            }
+
+        } finally {
+            Log.info(c, method, "<<< SERVER DUMP COMPLETE: " + this.getServerName() + " , localFile = " + lf);
+        }
+
+        return lf;
     }
 
     /**
@@ -5320,7 +5376,7 @@ public class LibertyServer implements LogMonitorClient {
      * log message that shows that the the application was shut down, then rename
      * the application to move it back into the drop-ins folder, then wait
      * for a log message that shows that the application was started.
-     * 
+     *
      * Because a single log may show multiple application start and multiple application
      * stop messages, the log message detection for this operation uses
      * {@link #waitForStringInLogUsingMark(String)}.
@@ -5348,7 +5404,9 @@ public class LibertyServer implements LogMonitorClient {
         // by property <code>zip.reaper.slow.pend.max</code>.  The default value
         // is 200 NS.  The retry interval is set at twice that.
 
-        if ( !LibertyFileManager.renameLibertyFileWithRetry(machine, appInDropinsPath, appExcisedPath) ) { // throws Exception
+        setMarkToEndOfLog();
+
+        if (!LibertyFileManager.renameLibertyFileWithRetry(machine, appInDropinsPath, appExcisedPath)) { // throws Exception
             Log.info(c, method, "Unable to move " + appFileName + " out of dropins, failing.");
             return false;
         } else {
@@ -5356,8 +5414,13 @@ public class LibertyServer implements LogMonitorClient {
         }
 
         String stopMsg = waitForStringInLogUsingMark("CWWKZ0009I:.*" + appName); // throws Exception
+        if (stopMsg == null) {
+            return false;
+        }
 
-        if ( !LibertyFileManager.renameLibertyFile(machine, appExcisedPath, appInDropinsPath) ) { // throws Exception
+        setMarkToEndOfLog();
+
+        if (!LibertyFileManager.renameLibertyFile(machine, appExcisedPath, appInDropinsPath)) { // throws Exception
             Log.info(c, method, "Unable to move " + appFileName + " back into dropins, failing.");
             return false;
         } else {
@@ -5365,6 +5428,9 @@ public class LibertyServer implements LogMonitorClient {
         }
 
         String startMsg = waitForStringInLogUsingMark("CWWKZ0001I:.*" + appName); // throws Exception
+        if (startMsg == null) {
+            return false;
+        }
 
         return true;
     }
@@ -5392,6 +5458,57 @@ public class LibertyServer implements LogMonitorClient {
         }
 
         return allSucceeded;
+    }
+
+    /**
+     *
+     * Removes one or more applications from dropins and wait for them to stop
+     *
+     * @param fileNames the file name or names of the application, e.g. snoop.war
+     * @return {@code true} if the applications were moved successfully, {@code false} otherwise.
+     * @throws Exception
+     */
+    public boolean removeAndStopDropinsApplications(String... fileNames) throws Exception {
+        boolean allSucceeded = true;
+
+        for (String fileName : fileNames) {
+            allSucceeded = allSucceeded && removeAndStopDropinsApplication(fileName);
+        }
+
+        return allSucceeded;
+    }
+
+    /**
+     *
+     * Removes an application from dropins and waits for it to stop
+     *
+     * @param fileNames the file name or names of the application, e.g. snoop.war
+     * @return {@code true} if the applications were moved successfully, {@code false} otherwise.
+     * @throws Exception
+     */
+    private boolean removeAndStopDropinsApplication(String appFileName) throws Exception {
+        final String method = "removeAndStopDropinsApplication";
+
+        setMarkToEndOfLog();
+
+        String appName = appFileName.substring(0, appFileName.lastIndexOf("."));
+        String appInDropinsPath = serverRoot + "/dropins/" + appFileName;
+        String nonDropinsFilePath = serverRoot + "/" + appFileName;
+
+        if (!LibertyFileManager.renameLibertyFileWithRetry(machine, appInDropinsPath, nonDropinsFilePath)) { // throws Exception
+            Log.info(c, method, "Unable to move " + appFileName + " out of dropins, failing.");
+            return false;
+        } else {
+            Log.info(c, method, appFileName + " successfully moved out of dropins, waiting for message...");
+        }
+
+        String stopMsg = waitForStringInLogUsingMark("CWWKZ0009I:.*" + appName); // throws Exception
+
+        if (stopMsg == null) {
+            return false;
+        }
+
+        return true;
     }
 
     /**
@@ -5434,6 +5551,11 @@ public class LibertyServer implements LogMonitorClient {
 
     public String getLogsRoot() {
         return logsRoot;
+    }
+
+    public void setExtraArgs(List<String> extraArgs) {
+        this.extraArgs.clear();
+        this.extraArgs.addAll(extraArgs);
     }
 
     /**
