@@ -88,12 +88,33 @@ public class SecurityContextImplTest {
             {
                 one(subjectManagerService).getCallerSubject();
                 will(returnValue(subject));
+                one(wsCred).isUnauthenticated();
+                will(returnValue(false));
+                one(wsCred).get("com.ibm.wsspi.security.cred.jaspi.principal");
+                will(returnValue(null));
+                one(wsCred).getSecurityName();
+                will(returnValue(accessId1));
             }
         });
         Principal callerPrinc = secContext.getCallerPrincipal();
-        assertEquals("Not expected princiapal.", callerPrinc, princ);
+        assertEquals("Not expected principal.", callerPrinc, new WSPrincipal(accessId1, princ.getAccessId(), princ.getAuthenticationMethod()));
 
     }
+
+//    @Test
+//    public void testGetCallerPrincipal_userInCallerSubject() throws Exception {
+//        final Subject subject = new Subject(false, principals, pubCredentials, privCredentials);
+//
+//        mockery.checking(new Expectations() {
+//            {
+//                one(subjectManagerService).getCallerSubject();
+//                will(returnValue(subject));
+//            }
+//        });
+//        Principal callerPrinc = secContext.getCallerPrincipal();
+//        assertEquals("Not expected princiapal.", callerPrinc, princ);
+//
+//    }
 
     @Test
     public void testGetCallerPrincipal_nullCallerSubject() throws Exception {
